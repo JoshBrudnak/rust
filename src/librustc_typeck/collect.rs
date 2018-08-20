@@ -919,10 +919,6 @@ fn generics_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let mut i = 0;
     params.extend(ast_generics.params.iter().filter_map(|param| match param.kind {
         GenericParamKind::Type { ref default, synthetic, .. } => {
-            if param.name.ident().name == keywords::SelfType.name() {
-                span_bug!(param.span,  "`Self` should not be the name of a regular parameter");
-            }
-
             if !allow_defaults && default.is_some() {
                 if !tcx.features().default_type_parameter_fallback {
                     tcx.lint_node(
