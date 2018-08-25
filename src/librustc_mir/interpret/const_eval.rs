@@ -359,6 +359,16 @@ impl<'mir, 'tcx> super::Machine<'mir, 'tcx> for CompileTimeEvaluator {
                 ecx.write_scalar(size_val, dest)?;
             }
 
+            "needs_drop" => {
+                let ty = substs.type_at(0);
+                let size = ecx.layout_of(ty)?.size.bytes() as u128;
+                let size_val = Scalar::Bits {
+                    bits: size,
+                    size: dest.layout.size.bytes() as u8,
+                };
+                ecx.write_scalar(size_val, dest)?;
+            }
+
             "type_id" => {
                 let ty = substs.type_at(0);
                 let type_id = ecx.tcx.type_id_hash(ty) as u128;
