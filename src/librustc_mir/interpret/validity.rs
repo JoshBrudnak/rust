@@ -11,17 +11,13 @@
 use std::fmt::Write;
 use std::hash::Hash;
 
-use syntax_pos::symbol::Symbol;
-use rustc::ty::layout::{self, Size, Align, TyLayout};
+use rustc::mir::interpret::{AllocType, EvalErrorKind, EvalResult, Scalar};
 use rustc::ty;
+use rustc::ty::layout::{self, Align, Size, TyLayout};
 use rustc_data_structures::fx::FxHashSet;
-use rustc::mir::interpret::{
-    Scalar, AllocType, EvalResult, EvalErrorKind
-};
+use syntax_pos::symbol::Symbol;
 
-use super::{
-    ValTy, OpTy, MPlaceTy, Machine, EvalContext, ScalarMaybeUndef
-};
+use super::{EvalContext, MPlaceTy, Machine, OpTy, ScalarMaybeUndef, ValTy};
 
 macro_rules! validation_failure {
     ($what:expr, $where:expr, $details:expr) => {{
@@ -63,7 +59,7 @@ macro_rules! try_validation {
             Ok(x) => x,
             Err(_) => return validation_failure!($what, $where),
         }
-    }}
+    }};
 }
 
 /// We want to show a nice path to the invalid field for diagnotsics,
@@ -86,7 +82,7 @@ pub struct RefTracking<'tcx, Tag> {
     pub todo: Vec<(OpTy<'tcx, Tag>, Vec<PathElem>)>,
 }
 
-impl<'tcx, Tag: Copy+Eq+Hash> RefTracking<'tcx, Tag> {
+impl<'tcx, Tag: Copy + Eq + Hash> RefTracking<'tcx, Tag> {
     pub fn new(op: OpTy<'tcx, Tag>) -> Self {
         let mut ref_tracking = RefTracking {
             seen: FxHashSet::default(),
@@ -100,7 +96,7 @@ impl<'tcx, Tag: Copy+Eq+Hash> RefTracking<'tcx, Tag> {
 // Adding a Deref and making a copy of the path to be put into the queue
 // always go together.  This one does it with only new allocation.
 fn path_clone_and_deref(path: &Vec<PathElem>) -> Vec<PathElem> {
-    let mut new_path = Vec::with_capacity(path.len()+1);
+    let mut new_path = Vec::with_capacity(path.len() + 1);
     new_path.clone_from(path);
     new_path.push(PathElem::Deref);
     new_path
@@ -118,11 +114,13 @@ fn path_format(path: &Vec<PathElem>) -> String {
             TupleElem(idx) => write!(out, ".{}", idx).unwrap(),
             ArrayElem(idx) => write!(out, "[{}]", idx).unwrap(),
             Deref =>
-                // This does not match Rust syntax, but it is more readable for long paths -- and
-                // some of the other items here also are not Rust syntax.  Actually we can't
-                // even use the usual syntax because we are just showing the projections,
-                // not the root.
-                write!(out, ".<deref>").unwrap(),
+            // This does not match Rust syntax, but it is more readable for long paths -- and
+            // some of the other items here also are not Rust syntax.  Actually we can't
+            // even use the usual syntax because we are just showing the projections,
+            // not the root.
+            {
+                write!(out, ".<deref>").unwrap()
+            }
             Tag => write!(out, ".<enum-tag>").unwrap(),
         }
     }
@@ -131,12 +129,9 @@ fn path_format(path: &Vec<PathElem>) -> String {
 
 fn scalar_format<Tag>(value: ScalarMaybeUndef<Tag>) -> String {
     match value {
-        ScalarMaybeUndef::Undef =>
-            "uninitialized bytes".to_owned(),
-        ScalarMaybeUndef::Scalar(Scalar::Ptr(_)) =>
-            "a pointer".to_owned(),
-        ScalarMaybeUndef::Scalar(Scalar::Bits { bits, .. }) =>
-            bits.to_string(),
+        ScalarMaybeUndef::Undef => "uninitialized bytes".to_owned(),
+        ScalarMaybeUndef::Scalar(Scalar::Ptr(_)) => "a pointer".to_owned(),
+        ScalarMaybeUndef::Scalar(Scalar::Bits { bits, .. }) => bits.to_string(),
     }
 }
 
@@ -154,14 +149,17 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
         match ty.sty {
             ty::Bool => {
                 let value = value.to_scalar_or_undef();
-                try_validation!(value.to_bool(),
-                    scalar_format(value), path, "a boolean");
-            },
+                try_validation!(value.to_bool(), scalar_format(value), path, "a boolean");
+            }
             ty::Char => {
                 let value = value.to_scalar_or_undef();
-                try_validation!(value.to_char(),
-                    scalar_format(value), path, "a valid unicode codepoint");
-            },
+                try_validation!(
+                    value.to_char(),
+                    scalar_format(value),
+                    path,
+                    "a valid unicode codepoint"
+                );
+            }
             ty::Float(_) | ty::Int(_) | ty::Uint(_) => {
                 // NOTE: Keep this in sync with the array optimization for int/float
                 // types below!
@@ -169,8 +167,12 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                 let value = value.to_scalar_or_undef();
                 if const_mode {
                     // Integers/floats in CTFE: Must be scalar bits, pointers are dangerous
-                    try_validation!(value.to_bits(size),
-                        scalar_format(value), path, "initialized plain bits");
+                    try_validation!(
+                        value.to_bits(size),
+                        scalar_format(value),
+                        path,
+                        "initialized plain bits"
+                    );
                 } else {
                     // At run-time, for now, we accept *anything* for these types, including
                     // undef. We should fix that, but let's start low.
@@ -181,59 +183,77 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                 // their metadata must be valid!
                 // This also checks that the ptr itself is initialized, which
                 // seems reasonable even for raw pointers.
-                let place = try_validation!(self.ref_to_mplace(value),
-                    "undefined data in pointer", path);
+                let place =
+                    try_validation!(self.ref_to_mplace(value), "undefined data in pointer", path);
                 // Check metadata early, for better diagnostics
                 if place.layout.is_unsized() {
                     let tail = self.tcx.struct_tail(place.layout.ty);
                     match tail.sty {
                         ty::Dynamic(..) => {
-                            let vtable = try_validation!(place.meta.unwrap().to_ptr(),
-                                "non-pointer vtable in fat pointer", path);
-                            try_validation!(self.read_drop_type_from_vtable(vtable),
-                                "invalid drop fn in vtable", path);
-                            try_validation!(self.read_size_and_align_from_vtable(vtable),
-                                "invalid size or align in vtable", path);
+                            let vtable = try_validation!(
+                                place.meta.unwrap().to_ptr(),
+                                "non-pointer vtable in fat pointer",
+                                path
+                            );
+                            try_validation!(
+                                self.read_drop_type_from_vtable(vtable),
+                                "invalid drop fn in vtable",
+                                path
+                            );
+                            try_validation!(
+                                self.read_size_and_align_from_vtable(vtable),
+                                "invalid size or align in vtable",
+                                path
+                            );
                             // FIXME: More checks for the vtable.
                         }
                         ty::Slice(..) | ty::Str => {
-                            try_validation!(place.meta.unwrap().to_usize(self),
-                                "non-integer slice length in fat pointer", path);
+                            try_validation!(
+                                place.meta.unwrap().to_usize(self),
+                                "non-integer slice length in fat pointer",
+                                path
+                            );
                         }
                         ty::Foreign(..) => {
                             // Unsized, but not fat.
                         }
-                        _ =>
-                            bug!("Unexpected unsized type tail: {:?}", tail),
+                        _ => bug!("Unexpected unsized type tail: {:?}", tail),
                     }
                 }
                 // for safe ptrs, also check the ptr values itself
                 if !ty.is_unsafe_ptr() {
                     // Make sure this is non-NULL and aligned
-                    let (size, align) = self.size_and_align_of(place.meta, place.layout)?
+                    let (size, align) = self
+                        .size_and_align_of(place.meta, place.layout)?
                         // for the purpose of validity, consider foreign types to have
                         // alignment and size determined by the layout (size will be 0,
                         // alignment should take attributes into account).
                         .unwrap_or_else(|| place.layout.size_and_align());
                     match self.memory.check_align(place.ptr, align) {
-                        Ok(_) => {},
+                        Ok(_) => {}
                         Err(err) => match err.kind {
-                            EvalErrorKind::InvalidNullPointerUsage =>
-                                return validation_failure!("NULL reference", path),
-                            EvalErrorKind::AlignmentCheckFailed { .. } =>
-                                return validation_failure!("unaligned reference", path),
-                            _ =>
+                            EvalErrorKind::InvalidNullPointerUsage => {
+                                return validation_failure!("NULL reference", path)
+                            }
+                            EvalErrorKind::AlignmentCheckFailed { .. } => {
+                                return validation_failure!("unaligned reference", path)
+                            }
+                            _ => {
                                 return validation_failure!(
                                     "dangling (out-of-bounds) reference (might be NULL at \
                                      run-time)",
                                     path
-                                ),
-                        }
+                                )
+                            }
+                        },
                     }
                     // non-ZST also have to be dereferenceable
                     if size != Size::ZERO {
-                        let ptr = try_validation!(place.ptr.to_ptr(),
-                            "integer pointer in non-ZST reference", path);
+                        let ptr = try_validation!(
+                            place.ptr.to_ptr(),
+                            "integer pointer in non-ZST reference",
+                            path
+                        );
                         if const_mode {
                             // Skip validation entirely for some external statics
                             let alloc_kind = self.tcx.alloc_map.lock().get(ptr.alloc_id);
@@ -247,8 +267,11 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                                 }
                             }
                         }
-                        try_validation!(self.memory.check_bounds(ptr, size, false),
-                            "dangling (not entirely in bounds) reference", path);
+                        try_validation!(
+                            self.memory.check_bounds(ptr, size, false),
+                            "dangling (not entirely in bounds) reference",
+                            path
+                        );
                     }
                     if let Some(ref_tracking) = ref_tracking {
                         // Check if we have encountered this pointer+layout combination
@@ -265,15 +288,18 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
             }
             ty::FnPtr(_sig) => {
                 let value = value.to_scalar_or_undef();
-                let ptr = try_validation!(value.to_ptr(),
-                    scalar_format(value), path, "a pointer");
-                let _fn = try_validation!(self.memory.get_fn(ptr),
-                    scalar_format(value), path, "a function pointer");
+                let ptr = try_validation!(value.to_ptr(), scalar_format(value), path, "a pointer");
+                let _fn = try_validation!(
+                    self.memory.get_fn(ptr),
+                    scalar_format(value),
+                    path,
+                    "a function pointer"
+                );
                 // FIXME: Check if the signature matches
             }
             // This should be all the primitive types
             ty::Never => bug!("Uninhabited type should have been caught earlier"),
-            _ => bug!("Unexpected primitive type {}", value.layout.ty)
+            _ => bug!("Unexpected primitive type {}", value.layout.ty),
         }
         Ok(())
     }
@@ -294,19 +320,23 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
             return Ok(());
         }
         // At least one value is excluded. Get the bits.
-        let value = try_validation!(value.not_undef(),
-            scalar_format(value), path, format!("something in the range {:?}", layout.valid_range));
+        let value = try_validation!(
+            value.not_undef(),
+            scalar_format(value),
+            path,
+            format!("something in the range {:?}", layout.valid_range)
+        );
         let bits = match value {
             Scalar::Ptr(ptr) => {
                 if lo == 1 && hi == max_hi {
                     // only NULL is not allowed.
                     // We can call `check_align` to check non-NULL-ness, but have to also look
                     // for function pointers.
-                    let non_null =
-                        self.memory.check_align(
-                            Scalar::Ptr(ptr), Align::from_bytes(1, 1).unwrap()
-                        ).is_ok() ||
-                        self.memory.get_fn(ptr).is_ok();
+                    let non_null = self
+                        .memory
+                        .check_align(Scalar::Ptr(ptr), Align::from_bytes(1, 1).unwrap())
+                        .is_ok()
+                        || self.memory.get_fn(ptr).is_ok();
                     if !non_null {
                         // could be NULL
                         return validation_failure!("a potentially NULL pointer", path);
@@ -325,7 +355,10 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                     );
                 }
             }
-            Scalar::Bits { bits, size: value_size } => {
+            Scalar::Bits {
+                bits,
+                size: value_size,
+            } => {
                 assert_eq!(value_size as u64, size.bytes());
                 bits
             }
@@ -382,31 +415,33 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
         // If this is a multi-variant layout, we have find the right one and proceed with that.
         // (No good reasoning to make this recursion, but it is equivalent to that.)
         let dest = match dest.layout.variants {
-            layout::Variants::NicheFilling { .. } |
-            layout::Variants::Tagged { .. } => {
+            layout::Variants::NicheFilling { .. } | layout::Variants::Tagged { .. } => {
                 let variant = match self.read_discriminant(dest) {
                     Ok(res) => res.1,
                     Err(err) => match err.kind {
-                        EvalErrorKind::InvalidDiscriminant(val) =>
+                        EvalErrorKind::InvalidDiscriminant(val) => {
                             return validation_failure!(
-                                format!("invalid enum discriminant {}", val), path
-                            ),
-                        _ =>
+                                format!("invalid enum discriminant {}", val),
+                                path
+                            )
+                        }
+                        _ => {
                             return validation_failure!(
-                                format!("non-integer enum discriminant"), path
-                            ),
-                    }
+                                format!("non-integer enum discriminant"),
+                                path
+                            )
+                        }
+                    },
                 };
                 // Put the variant projection onto the path, as a field
-                path.push(PathElem::Field(dest.layout.ty
-                                          .ty_adt_def()
-                                          .unwrap()
-                                          .variants[variant].name));
+                path.push(PathElem::Field(
+                    dest.layout.ty.ty_adt_def().unwrap().variants[variant].name,
+                ));
                 // Proceed with this variant
                 let dest = self.operand_downcast(dest, variant)?;
                 trace!("variant layout: {:#?}", dest.layout);
                 dest
-            },
+            }
             layout::Variants::Single { .. } => dest,
         };
 
@@ -416,8 +451,8 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
             ty::Dynamic(..) => {
                 let dest = dest.to_mem_place(); // immediate trait objects are not a thing
                 self.unpack_dyn_trait(dest)?.1.into()
-            },
-            _ => dest
+            }
+            _ => dest,
         };
 
         // If this is a scalar, validate the scalar layout.
@@ -428,11 +463,15 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
         // scalars, we do the same check on every "level" (e.g. first we check
         // MyNewtype and then the scalar in there).
         match dest.layout.abi {
-            layout::Abi::Uninhabited =>
-                return validation_failure!("a value of an uninhabited type", path),
+            layout::Abi::Uninhabited => {
+                return validation_failure!("a value of an uninhabited type", path)
+            }
             layout::Abi::Scalar(ref layout) => {
-                let value = try_validation!(self.read_scalar(dest),
-                            "uninitialized or unrepresentable data", path);
+                let value = try_validation!(
+                    self.read_scalar(dest),
+                    "uninitialized or unrepresentable data",
+                    path
+                );
                 self.validate_scalar_layout(value, dest.layout.size, &path, layout)?;
             }
             // FIXME: Should we do something for ScalarPair? Vector?
@@ -450,14 +489,12 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
             _ => dest.layout.ty.builtin_deref(true).is_some(),
         };
         if primitive {
-            let value = try_validation!(self.read_value(dest),
-                "uninitialized or unrepresentable data", path);
-            return self.validate_primitive_type(
-                value,
-                &path,
-                ref_tracking,
-                const_mode,
+            let value = try_validation!(
+                self.read_value(dest),
+                "uninitialized or unrepresentable data",
+                path
             );
+            return self.validate_primitive_type(value, &path, ref_tracking, const_mode);
         }
 
         // Validate all fields of compound data structures
@@ -467,7 +504,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                 // We can't check unions, their bits are allowed to be anything.
                 // The fields don't need to correspond to any bit pattern of the union's fields.
                 // See https://github.com/rust-lang/rust/issues/32836#issuecomment-406875389
-            },
+            }
             layout::FieldPlacement::Arbitrary { ref offsets, .. } => {
                 // Go look at all the fields
                 for i in 0..offsets.len() {
@@ -493,18 +530,27 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                 match dest.layout.ty.sty {
                     // Special handling for strings to verify UTF-8
                     ty::Str => {
-                        try_validation!(self.read_str(dest),
-                            "uninitialized or non-UTF-8 data in str", path);
+                        try_validation!(
+                            self.read_str(dest),
+                            "uninitialized or non-UTF-8 data in str",
+                            path
+                        );
                     }
                     // Special handling for arrays/slices of builtin integer types
-                    ty::Array(tys, ..) | ty::Slice(tys) if {
-                        // This optimization applies only for integer and floating point types
-                        // (i.e., types that can hold arbitrary bytes).
-                        match tys.sty {
-                            ty::Int(..) | ty::Uint(..) | ty::Float(..) => true,
+                    ty::Array(tys, ..) | ty::Slice(tys)
+                        if {
+                            // This optimization applies only for integer and floating point types
+                            // (i.e., types that can hold arbitrary bytes).
+                            match tys.sty {
+                                ty::Int(..) | ty::Uint(..) | ty::Float(..) => true,
+                                _ => false,
+                            }
+                        } =>
+                    true,
                             _ => false,
                         }
-                    } => {
+                    } =>
+                    {
                         // This is the length of the array/slice.
                         let len = dest.len(self)?;
                         // Since primitive types are naturally aligned and tightly packed in arrays,
@@ -525,10 +571,10 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                         match self.memory.check_bytes(
                             dest.ptr,
                             size,
-                            /*allow_ptr_and_undef*/!const_mode,
+                            /*allow_ptr_and_undef*/ !const_mode,
                         ) {
                             // In the happy case, we needn't check anything else.
-                            Ok(()) => {},
+                            Ok(()) => {}
                             // Some error happened, try to provide a more detailed description.
                             Err(err) => {
                                 // For some errors we might be able to provide extra information
@@ -540,16 +586,14 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                                         let i = (offset.bytes() / ty_size) as usize;
                                         path.push(PathElem::ArrayElem(i));
 
-                                        return validation_failure!(
-                                            "undefined bytes", path
-                                        )
-                                    },
+                                        return validation_failure!("undefined bytes", path);
+                                    }
                                     // Other errors shouldn't be possible
                                     _ => return Err(err),
                                 }
                             }
                         }
-                    },
+                    }
                     _ => {
                         // This handles the unsized case correctly as well, as well as
                         // SIMD an all sorts of other array-like types.
@@ -566,7 +610,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
                         }
                     }
                 }
-            },
+            }
         }
         Ok(())
     }
@@ -600,7 +644,10 @@ impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> 
             ty::Adt(def, _) => PathElem::Field(def.non_enum_variant().fields[field].ident.name),
 
             // nothing else has an aggregate layout
-            _ => bug!("aggregate_field_path_elem: got non-aggregate type {:?}", layout.ty),
+            _ => bug!(
+                "aggregate_field_path_elem: got non-aggregate type {:?}",
+                layout.ty
+            ),
         }
     }
 }
